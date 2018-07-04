@@ -32,13 +32,14 @@ use warnings FATAL => 'all';
 
 use Net::SNMP;
 use Getopt::Long;
-use vars qw($opt_P $opt_h $opt_H $opt_W $opt_C $opt_p $opt_w $opt_c $opt_t $verbose $opt_2 $opt_f);
+use vars qw($opt_P $opt_h $opt_H $opt_W $opt_C $opt_p $opt_w $opt_c $opt_t $verbose $opt_2 $opt_f $opt_r);
 
 $ENV{'PATH'}='';
 $ENV{'BASH_ENV'}='';
 $ENV{'ENV'}='';
 
 my $snmp_version = 1;
+my $blacklist = '/boot/efi|/vz/smbimporter|.*share$';
 
 # OID table/range we're going to use here
 my $oid_table = '.1.3.6.1.4.1.2021.9.1';
@@ -85,6 +86,8 @@ Available options:
     use snmp v2c (default: v1)
          -f | --perfdata
     add performance output
+         -r | --regex
+    limit to matching partitions
 EOT
 
 }
@@ -109,6 +112,7 @@ GetOptions (
   "C=s" => \$opt_C, "inodecrit=s" => \$opt_C,
   "p=s" => \$opt_p, "community=s" => \$opt_p,
   "H=s" => \$opt_H, "hostname=s"  => \$opt_H,
+  "r=s" => \$opt_r, "regex=s"     => \$opt_r,
   "2"   => \$opt_2, "v2c"         => \$opt_2,
   "f"   => \$opt_f, "perfdata"    => \$opt_f,
   );
@@ -128,6 +132,10 @@ my $hostname = $1 if ($opt_H =~ /^([-.A-Za-z0-9]+\$?)$/);
 # Community
 ($opt_p) || ($opt_p = shift) || ($opt_p = "public");
 my $community = $1 if ($opt_p =~ /(.*)/);
+
+# regex
+($opt_r) || ($opt_r = shift) || ($opt_r = ".*");
+my $regex = $1 if ($opt_r =~ /(.*)/);
 
 # Diskspace warning threshold
 ($opt_w) || ($opt_w = shift) || ($opt_w = 90);
@@ -210,7 +218,7 @@ foreach my $oid (keys %$result) {
   #print "OID: $oid\n";
   if ( $oid =~ /^\Q$oid_table.3.\E/ ) {
     push @real_disks, $oid unless $$result{$oid} =~
-      /^(?:none|sunrpc|usbfs|nfsd|proc|devpts|udev|sysfs|devfs|rpc_pipefs|binfmt_misc|fusectl|beancounter|container|fairsched|gvfs-fuse-daemon)$/;
+      /^(?:none|sunrpc|usbfs|nfsd|proc|devpts|udev|sysfs|devfs|rpc_pipefs|binfmt_misc|fusectl|beancounter|container|fairsched|gvfs-fuse-daemon|debugfs|cgroup)$/;
   }
 }
 
@@ -224,21 +232,27 @@ foreach my $disk_oid (@real_disks) {
   (my $inode_oid = $disk_oid) =~ s/^\Q$oid_table.3.\E/$oid_table.10./;
   (my $index = $disk_oid ) =~ s/^.*\.//g;
 
+  if (($$result{$path_oid} =~ /$regex/) && ($$result{$path_oid} !~ /$blacklist/)) {
+
   my $status = 'OK';
   my $status_string = 'Disk: ' . $$result{$path_oid} .' ';
   my $perfdata = '';
+  my $used_diskspace = $$result{$diskspace_oid};
 
-  if ($$result{$diskspace_oid} >= $diskspace_crit) {
+  # virtuozzo ploop workaround
+  $used_diskspace += 5 if $$result{$disk_oid} =~ /ploop/;
+
+  if ($used_diskspace >= $diskspace_crit) {
     $status = 'CRITICAL';
-    $status_string .= 'diskpace crit: ' . $$result{$diskspace_oid} . '%';
-  } elsif ($$result{$diskspace_oid} >= $diskspace_warn) {
+    $status_string .= 'diskpace crit: ' . $used_diskspace . '%';
+  } elsif ($used_diskspace >= $diskspace_warn) {
     $status = 'WARNING';
-    $status_string .= 'diskpace warn: ' . $$result{$diskspace_oid} . '%';
+    $status_string .= 'diskpace warn: ' . $used_diskspace . '%';
   } else {
     $status_string .= 'diskspace ok';
   }
 
-  $perfdata .= $$result{$path_oid} . "_(space)" . "=" . $$result{$diskspace_oid}
+  $perfdata .= $$result{$path_oid} . "_(space)" . "=" . $used_diskspace
               . "%" . ";" . $diskspace_warn . ";" . $diskspace_crit
               . ";0;100";
 
@@ -265,6 +279,7 @@ foreach my $disk_oid (@real_disks) {
     'status_string'  => $status_string,
     'perfdata'       => $perfdata,
   );
+  }
 }
 
 my $state_string;
@@ -272,9 +287,10 @@ my $perf_string;
 
 foreach my $disk (sort {$a <=> $b} (keys(%disk_h))) {
   $perf_string .= $disk_h{$disk}{'perfdata'} . " ";
-  next if (!$verbose && $disk_h{$disk}{'status'} =~ /^OK$/ );
-  $state = $disk_h{$disk}{'status'} unless ($state eq 'CRITICAL');
-  $state_string .= $disk_h{$disk}{'status_string'};
+  unless ($state eq 'CRITICAL') {
+    $state = $disk_h{$disk}{'status'} unless ( $disk_h{$disk}{'status'} eq 'OK' );
+  }
+  $state_string .= $disk_h{$disk}{'status_string'} if ( $verbose || $disk_h{$disk}{'status'} ne 'OK' ) ;
 }
 
 print $state . ": ";
